@@ -1,0 +1,25 @@
+# Ignore dot-prefixed directories at every level.
+.*/
+.env
+.env.*
+containers/*.sif
+data/
+models/
+runs/
+reports/
+logs/
+external/
+archive/
+*.o[0-9]*
+__pycache__/
+*.pyc
+.DS_Store
+
+# Exclude reviewed experimental results and large/private runtime artifacts.
+result/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.pem
+*.key

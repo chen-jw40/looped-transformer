@@ -1,0 +1,12 @@
+#!/bin/bash
+#PBS -N ouro_5seeds
+#PBS -q regular-g
+#PBS -W group_list=gn77
+#PBS -l select=5:mpiprocs=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?}"
+: "${SEED_STUDY_ROOT:?frozen study root required}"
+export PYTHONUNBUFFERED=1
+python3 "$SEED_STUDY_ROOT/parallel_seeds.py" --dispatch "$SEED_STUDY_ROOT"

@@ -1,0 +1,50 @@
+#!/bin/bash
+#PBS -N ouro_test_seed
+#PBS -q regular-g
+#PBS -W group_list=gn77
+#PBS -l select=1
+#PBS -l walltime=12:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:-$PWD}"
+
+# 以下为 Python 配置；PBS_DRY_RUN=1 时仅打印解析结果，不申请/启动 GPU 进程。
+python3 - <<'PYCONFIG'
+import os
+from scripts.pbs_launch import launch
+
+# 每个作业测试一个已训练的 full finetuning seed；qsub -v TEST_SEED=43 等。
+# 固定协议：八个任务的完整 test.json、最终 08_after_20Minuten checkpoint。
+# 不执行训练；历史学习率、epoch 等从 source summary.json 读取并保留。
+SEED = int(os.environ.get("TEST_SEED", "42"))
+SOURCES = {
+    42: "runs/20261002_full_unconstrained_k4_vllm",
+    43: "runs/20261004_full_unconstrained_k4_seeds/seed43",
+    44: "runs/20261004_full_unconstrained_k4_seeds/seed44",
+    45: "runs/20261004_full_unconstrained_k4_seeds/seed45",
+    46: "runs/20261004_full_unconstrained_k4_seeds/seed46",
+}
+CONFIG = {
+    "seed": SEED,
+    "source_run": SOURCES[SEED],
+    "output_root": "runs/20261005_direct_finetune_k4_5seeds_test",
+    "model": None,  # None = source 的 tokenizer 路径；权重使用其最终 checkpoint
+    "data_root": None,  # None = source 的数据根目录
+    "loop_depth": 4,
+    "max_length": 4096,
+    "truncate_long_prompts": True,
+    "batch_size": 64,
+    "gpu_memory_utilization": 0.85,
+    "temperature": 0.0,
+    "max_new_tokens": None,
+    "max_new_tokens_by_task": {
+        "FOMC": 8, "ScienceQA": 1024, "NumGLUE-cm": 32, "NumGLUE-ds": 32,
+        "C-STANCE": 8, "MeetingBank": 1024, "Py150": 256, "20Minuten": 512,
+    },
+    "prepare_only": False,
+    "dry_run": False,
+}
+# 五个 seed 使用一致设置，最后完成的作业自动汇总均值和样本标准差。
+# 改变生成/数据设置时请使用新的 output_root。
+launch("test-seeds", CONFIG)
+PYCONFIG

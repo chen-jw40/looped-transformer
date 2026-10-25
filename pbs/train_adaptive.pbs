@@ -1,0 +1,98 @@
+#!/bin/bash
+#PBS -N ouro_joint
+#PBS -q regular-g
+#PBS -W group_list=gn77
+#PBS -l select=1
+#PBS -l walltime=12:00:00
+#PBS -j oe
+# 自适应历史联合基；任务边界增加谱更新与选择开销，12h 尚需实测。
+set -euo pipefail
+cd "${PBS_O_WORKDIR:-$PWD}"
+
+# 以下为 Python 配置；PBS_DRY_RUN=1 时仅打印解析结果，不申请/启动 GPU 进程。
+python3 - <<'PYCONFIG'
+import os
+from scripts.pbs_launch import launch
+
+# qsub -v 可覆盖 BASIS_STRATEGY、BASIS_MAX_RANK、HISTORY_RANK、SEED、RUN_DIR。
+METHOD = "projected"
+STRATEGY = os.environ.get("BASIS_STRATEGY", "joint_greedy")
+TASKS = ["FOMC", "ScienceQA", "NumGLUE-cm", "NumGLUE-ds",
+         "C-STANCE", "MeetingBank", "Py150", "20Minuten"]
+LEARNING_RATES = {"full": 1e-5, "projected": 1e-5, "osft": 1e-5, "olora": 1e-5}
+CONFIG = {
+    # 模型、数据及训练序列；输出必须是新目录。
+    "method": METHOD,
+    "output_dir": os.environ.get("RUN_DIR", f"runs/new_{STRATEGY}_seed{os.environ.get('SEED', '42')}"),
+    "model": "models/Ouro-1.4B",
+    "data_root": "data/TRACE/TRACE-Benchmark/LLM-CL-Benchmark_5000",
+    "tasks": TASKS,
+    "seed": int(os.environ.get("SEED", "42")),
+    "loops": 4,
+    "train_limit": 5000,
+    "epochs": None,  # TRACE per-task 3/5/7 epochs
+    "learning_rate": LEARNING_RATES[METHOD],
+    "weight_decay": 0.0,
+    "micro_batch_size": 8,
+    "gradient_accumulation": 16,
+    "max_length": 4096,
+    "truncate_long_prompts": True,
+
+    # 固定 epoch 训练；不运行 early stopping 或恢复中间最佳权重。
+    "early_stopping": False,
+    "early_stopping_steps": 150,
+    "early_stopping_max_evals": 6,
+    "early_stopping_samples": 128,
+    "early_stopping_seed": 42,
+    "early_stopping_patience": 2,
+    "early_stopping_min_delta": 0.001,
+
+    # 全参数 projected 的历史激活投影。
+    "projection_scope": "all-linear",  # 全参数 projected：all-linear / o-proj
+    "basis_depth_mode": "all",  # 四深度采集；可设 last 做历史重选对照
+    "basis_strategy": STRATEGY,  # joint_greedy / joint_local / joint_pca / joint_balanced
+    "history_rank": int(os.environ.get("HISTORY_RANK", "512")),  # 每深度历史摘要
+    "basis_balance_epsilon": float(os.environ.get("BASIS_BALANCE_EPSILON", "0.01")),
+    "basis_svd_method": "randomized",  # exact 可做数值核对
+    "route_depths": None,  # 仅 task 模式使用，如 [0, 0, 1, 1, 2, 2, 3, 3]
+    "stat_samples": 64,
+    "stat_vectors_per_call": 4,
+    "stat_vectors_per_layer": 256,  # 每个物理线性模块、每个深度的采样向量上限
+    "basis_max_rank": int(os.environ.get("BASIS_MAX_RANK", "512")),  # 每物理模块最终联合基上限
+    "basis_residual_tolerance": 0.05,  # 仅 append 策略使用
+    # OSFT：保护比例为 (stage-1)/任务数，与循环深度无关；前后投影均启用。
+    "osft_tolerance": 1e-4,
+
+    # O-LoRA：原作者发布代码版本，仅 q/v，所有循环共享 adapter。
+    "olora_rank": 8,
+    "olora_alpha": 32.0,
+    "olora_dropout": 0.1,
+    "olora_orthogonality_weight": 0.5,
+    "olora_norm_weight": 0.0,
+
+    # 训练后评测：train_only=True 可跳过；None 表示不限制 eval 样本数。
+    "train_only": False,
+    "eval_tasks": TASKS,
+    "eval_split": "test",
+    "eval_limit": None,
+    "eval_loops": 4,
+    "checkpoint_scope": "all" if METHOD in {"projected", "osft", "olora"} else "final",  # final / all
+    "batch_size": 64,
+    "gpu_memory_utilization": 0.85,
+    "temperature": 0.0,
+    "max_new_tokens": None,  # 设为整数时覆盖下方所有任务的生成上限
+    "max_new_tokens_by_task": {
+        "FOMC": 8, "ScienceQA": 1024, "NumGLUE-cm": 32, "NumGLUE-ds": 32,
+        "C-STANCE": 8, "MeetingBank": 1024, "Py150": 256, "20Minuten": 512,
+    },
+
+    # 日志；None 表示不指定可选参数。
+    "env_file": ".env",
+    "wandb_project": "ouro-continual-learning",
+    "wandb_entity": None,
+    "wandb_run_name": None,
+    "wandb_mode": "disabled",  # online / offline / disabled
+    "dry_run": False,
+}
+launch("train", CONFIG)
+PYCONFIG

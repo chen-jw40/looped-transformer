@@ -1,0 +1,79 @@
+#!/bin/bash
+#PBS -N ouro_last128
+#PBS -q regular-g
+#PBS -W group_list=gn77
+#PBS -l select=1
+#PBS -l walltime=12:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:-$PWD}"
+
+# 仅最后深度构基；保持单基 rank 和每深度采样参数为 128 / 4 / 256。
+# SEED、RUN_DIR 可由 qsub -v 覆盖；PBS_DRY_RUN=1 只打印配置。
+python3 - <<'PYCONFIG'
+import os
+from scripts.pbs_launch import launch
+
+TASKS = ["FOMC", "ScienceQA", "NumGLUE-cm", "NumGLUE-ds",
+         "C-STANCE", "MeetingBank", "Py150", "20Minuten"]
+CONFIG = {
+    "method": "projected",
+    "output_dir": os.environ.get("RUN_DIR", "runs/new_projected_last_rank128"),
+    "model": "models/Ouro-1.4B",
+    "data_root": "data/TRACE/TRACE-Benchmark/LLM-CL-Benchmark_5000",
+    "tasks": TASKS,
+    "seed": int(os.environ.get("SEED", "42")),
+    "loops": 4,
+    "train_limit": 5000,
+    "epochs": None,  # TRACE per-task 3/5/7 epochs
+    "learning_rate": 1e-5,
+    "weight_decay": 0.0,
+    "micro_batch_size": 8,
+    "gradient_accumulation": 16,
+    "max_length": 4096,
+    "truncate_long_prompts": True,
+
+    "early_stopping": False,
+    "early_stopping_steps": 150,
+    "early_stopping_max_evals": 6,
+    "early_stopping_samples": 128,
+    "early_stopping_seed": 42,
+    "early_stopping_patience": 2,
+    "early_stopping_min_delta": 0.001,
+
+    "projection_scope": "all-linear",
+    "basis_depth_mode": "last",
+    "route_depths": None,
+    "stat_samples": 64,
+    "stat_vectors_per_call": 4,
+    "stat_vectors_per_layer": 256,
+    "basis_max_rank": 128,
+    "basis_residual_tolerance": 0.05,
+
+    "train_only": False,
+    "eval_tasks": TASKS,
+    "eval_split": "test",
+    "eval_limit": None,
+    "eval_loops": 4,
+    "checkpoint_scope": "all",
+    "batch_size": 64,
+    "gpu_memory_utilization": 0.85,
+    "temperature": 0.0,
+    "max_new_tokens": None,
+    "max_new_tokens_by_task": {
+        "FOMC": 8, "ScienceQA": 1024, "NumGLUE-cm": 32, "NumGLUE-ds": 32,
+        "C-STANCE": 8, "MeetingBank": 1024, "Py150": 256, "20Minuten": 512,
+    },
+
+    "env_file": ".env",
+    "wandb_project": "ouro-continual-learning",
+    "wandb_entity": None,
+    "wandb_run_name": None,
+    "wandb_mode": "disabled",
+    "dry_run": False,
+}
+launch("train", CONFIG)
+if os.environ.get("PROJECTED_STUDY_ROOT"):
+    launch("summarize-study", {"output_root": os.environ["PROJECTED_STUDY_ROOT"],
+                              "methods": ["projected"], "if_ready": True})
+PYCONFIG

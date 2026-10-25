@@ -1,0 +1,608 @@
+\documentclass[UTF8,11pt,a4paper,fontset=fandol]{ctexart}
+\usepackage[margin=25mm]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools,bm}
+\usepackage{booktabs,tabularx,array,longtable}
+\usepackage{enumitem,xcolor,microtype}
+\usepackage[unicode,colorlinks=true,linkcolor=blue!55!black,citecolor=blue!55!black,urlcolor=blue!55!black]{hyperref}
+\usepackage{bookmark}
+\numberwithin{equation}{section}
+\setcounter{tocdepth}{1}
+\setlist{nosep,leftmargin=2em}
+\setlength{\emergencystretch}{2em}
+\setlength{\parskip}{0.3em}
+\renewcommand{\arraystretch}{1.18}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\DeclareMathOperator{\rank}{rank}
+\DeclareMathOperator{\col}{col}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\vecop}{vec}
+\DeclareMathOperator{\softmax}{softmax}
+\DeclareMathOperator{\KL}{KL}
+\DeclareMathOperator{\Orth}{Orth}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\EE}{\mathbb{E}}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\inner}[2]{\left\langle#1,#2\right\rangle}
+\newcommand{\Ktr}{K_{\mathrm{tr}}}
+\newcommand{\Kpr}{K_{\mathrm{pr}}}
+\newcommand{\Kev}{K_{\mathrm{ev}}}
+\newtheorem{assumption}{假设}[section]
+\newtheorem{proposition}{命题}[section]
+\newtheorem{corollary}[proposition]{推论}
+\newtheorem{lemma}[proposition]{引理}
+\theoremstyle{definition}
+\newtheorem{example}{例}[section]
+\theoremstyle{remark}
+\newtheorem{remark}{说明}[section]
+\renewcommand{\proofname}{证明}
+\title{循环深度与零空间约束下的持续学习\\
+\large 问题设定、共享低秩方法与完整数学推导工作稿}
+\author{作者待补}
+\date{2026 年 9 月 13 日\quad v0.1}
+\begin{document}
+\maketitle
+\begin{abstract}
+本文研究共享参数循环语言模型中的持续学习问题：在固定参数容量、可比较计算预算与旧任务保护约束下，循环深度如何影响新任务的可用更新方向？我们区分由局部激活定义的输入零空间、保护整条参考轨迹的矩阵更新空间，以及保持最终输出的一阶参数零空间。在线性模型中推导空间随深度变化的关系、有限扰动展开和跨循环抵消；随后推广到确定性的共享循环 Transformer。基于这些区分，给出跨循环共享的投影低秩增量参数化、阶段合并、历史基维护及近似误差分析，并将理想函数空间投影与实际低秩训练明确分离。本文是可继续编辑的理论和方法工作稿，不报告尚未运行的实验，不宣称零遗忘、深度收益的普遍性或方法的首次性。候选实验基座为 Ouro-1.4B，任务流为 TRACE。
+\end{abstract}
+\section*{工作稿定位与使用说明}
+\addcontentsline{toc}{section}{工作稿定位与使用说明}
+本文件采用 UTF-8 编码，使用 XeLaTeX 编译两遍以解析目录与交叉引用，也可使用 Tectonic。参考文献内置，不依赖外部 \texttt{.bib}、图片或私有字体。编译命令为：
+\begin{quote}\ttfamily
+xelatex loop\_depth\_nullspace\_continual\_learning.tex
+\end{quote}
+本稿按最新讨论以 Ouro 为实验候选，不修改此前以 Huginn 为候选的 Markdown 记录。第~\ref{sec:prelim}~节可用作论文 Preliminaries，第~\ref{sec:method}~节可用作 Method；第~\ref{sec:linear}、\ref{sec:function}、\ref{sec:nonlinear}~节给出理论推导与证明，第~\ref{sec:geometry}~节定义机制诊断，第~\ref{sec:experiments}~节给出实验接口。\textbf{理想化推导、实际算法、可选诊断和待验证假设分别标注，不将诊断指标冒充训练算法。}
+\clearpage
+\begingroup
+\small
+\setlength{\parskip}{0pt}
+\tableofcontents
+\endgroup
+\clearpage
+
+\section{问题设定与预备知识（Preliminaries）}\label{sec:prelim}
+\subsection{持续学习协议}
+任务按 $\mathcal T_1,\ldots,\mathcal T_T$ 顺序到来，任务 $t$ 的训练数据为
+\begin{equation}
+\mathcal D_t=\{(x_i,y_i)\}_{i=1}^{n_t}.
+\end{equation}
+$x_i$ 为任务所需的指令及输入，$y_i$ 为目标回答。阶段 $t$ 的训练器仅使用当前训练数据和历史压缩统计，不回放旧任务原始样本，不使用测试数据构造保护空间。评估可访问规定的旧任务评估集，但其测试样本、梯度和测试结果不反馈给训练器或超参数选择。
+记 $\Theta_{t-1}$ 为进入阶段 $t$ 时的参数，$p_{\Theta,K}$ 为执行 $K$ 圈后的条件分布。只在回答 token 上计算经验损失：
+\begin{equation}\label{eq:cl-loss}
+\mathcal L_t(\Theta;K)
+=-\frac{1}{n_t}\sum_{i=1}^{n_t}\frac{1}{|y_i|}
+\sum_{j=1}^{|y_i|}\log p_{\Theta,K}(y_{i,j}\mid x_i,y_{i,<j}).
+\end{equation}
+式~\eqref{eq:cl-loss}~采用样本内长度归一化；若实现采用批内有效 token 平均，需同步修改定义。Prompt 和 padding 不参与监督，答案及终止符的监督按预先固定的模板构造。旧任务完整分布和损失在无回放训练中不可直接访问，因此历史激活保护是\emph{代理约束}，不是直接优化全部旧任务损失。
+
+\subsection{三个不能混同的深度}
+训练深度 $\Ktr$ 控制新任务梯度的计算路径，保护深度 $\Kpr$ 控制历史激活覆盖范围，评估深度 $\Kev$ 控制报告任务分数时的执行路径。若保护多个出口，记其集合为 $\mathcal K_{\mathrm{pr}}$。机制分析改变其中一个量时，应固定其他量，或明确报告交叉设计。
+
+\subsection{共享循环模型与 Ouro 的实例化}
+令 $H^{(k)}$ 为给定 token 序列的\emph{全部隐藏状态}，向量化记为 $h_k$。统一写作
+\begin{equation}\label{eq:recurrence}
+h_{k+1}=F_\Theta(h_k;\xi),\quad h_0=E_\Theta(x),\quad
+z_K=G_\Theta(h_K),\quad p_K=\softmax(z_K).
+\end{equation}
+$\xi$ 包含固定输入、因果掩码和位置信息。每圈复用同一组参数，但同一圈内部不同物理层各有自己的权重。对 Ouro，$E$ 为嵌入，$F$ 为完整共享主干及圈末归一化，$G$ 为输出头，不额外假设 Huginn 式每圈 Prelude 注入。后者可由一般的 $F(h;\xi)$ 表达，但不是 Ouro 的具体实现。
+Ouro-1.4B 的配置包含 24 个物理 Transformer 层，因此忽略嵌入和输出头时，执行层数为 $24K$，独立参数数目不随 $K$ 增加。计算、训练激活和未压缩 KV cache 仍可能随 $K$ 增长。本文使用固定最终出口，不把自适应出口的加权训练误写为单出口目标。
+
+\begin{assumption}[配对轨迹与确定性]\label{ass:prefix}
+比较深度时，权重、输入序列、掩码、位置、初始状态及随机数实现相同。总预算不改变前缀运算，不启用提前退出、跨 token 隐状态热启动或未配对随机扰动。因此较浅轨迹是较深轨迹的前缀。
+\end{assumption}
+\begin{assumption}[冻结与坐标]\label{ass:coords}
+仅更新预先指定的线性层集合 $\mathcal S$；嵌入、输出头、归一化、出口 gate 及其他非目标参数冻结。有效权重坐标为
+\begin{equation}
+\vartheta=\operatorname{Concat}_{\ell\in\mathcal S}\vecop(W_\ell)\in\RR^p,
+\end{equation}
+其中 $\vecop$ 按列向量化。实际 LoRA 因子坐标另记为 $\phi$，不与 $\vartheta$ 混同。
+\end{assumption}
+
+\subsection{符号汇总}
+\begin{longtable}{p{0.24\textwidth}p{0.69\textwidth}}
+\toprule 符号 & 含义\\\midrule\endhead
+$t,\ell,k,j$ & 任务阶段、物理层、循环位置、token 位置\\
+$\Ktr,\Kpr,\Kev$ & 训练、保护、评估深度\\
+$W_\ell,\Delta W_{\ell,t}$ & 物理线性层权重及阶段增量\\
+$a_{\ell,k,j}$ & 进入目标线性层的列向量激活\\
+$X_{\ell,k},X_\ell^{(K)}$ & 单圈激活矩阵及前 $K$ 圈拼接矩阵\\
+$U_{\ell,t},P_{\ell,t}$ & 历史保护基及其正交补投影\\
+$r,m_{\ell,t}$ & 活动 LoRA rank 与历史保护基维数，二者不同\\
+$\mathcal N,\mathcal T,\mathcal F$ & 输入允许空间、轨迹参数空间、输出一阶参数空间\\
+$\vartheta,\phi$ & 有效层权重坐标、低秩因子坐标\\
+$J_{\mathrm{old},K}$ & 指定旧参考输出对有效权重的 Jacobian\\
+$\Pi_{\mathrm{pr}}$ & 参数空间中的理想函数保护投影\\
+\bottomrule
+\end{longtable}
+
+\section{线性循环中的精确推导}\label{sec:linear}
+本节研究 $X_k=W^kX_0$，其中 $W\in\RR^{d\times d}$、$X_0\in\RR^{d\times n}$。同一增量 $E$ 在每圈复用，更新后 $X'_k=(W+E)^kX_0$。这是可证明的简化系统，\textbf{不是将实际 Transformer 宣称为线性系统}。
+\subsection{单圈激活的允许更新空间}
+\begin{proposition}[局部精确保留]\label{prop:local}
+固定输入 $X_k$ 时，$(W+E)X_k=WX_k$ 当且仅当 $EX_k=0$。令 $U_k$ 为 $\col(X_k)$ 的正交基，$P_k=I-U_kU_k^\top$，则
+\begin{equation}\label{eq:local-null}
+\mathcal N_k=\ker(X_k^\top)=\col(X_k)^\perp,
+\qquad EX_k=0\iff E=EP_k.
+\end{equation}
+因此任意 $E=MP_k$ 都满足局部精确保留。
+\end{proposition}
+\begin{proof}
+输出差为 $EX_k$。$EX_k=0$ 等价于 $E$ 的每行与 $\col(X_k)$ 正交，即 $EU_k=0$，也就是 $E=E(I-U_kU_k^\top)$。
+\end{proof}
+$\mathcal N_k$ 位于 $d$ 维输入空间，矩阵更新集合 $\mathcal T_k=\{E:EX_k=0\}$ 位于 $d^2$ 维参数空间，满足
+\begin{equation}
+\dim\mathcal N_k=d-\rank(X_k),\quad
+\dim\mathcal T_k=d\bigl(d-\rank(X_k)\bigr).
+\end{equation}
+这不是通常位于 $\RR^n$ 中的 $\ker(X_k)$，也尚未加入低秩约束。
+\begin{proposition}[单圈空间的深度变化]
+如果 $W$ 可逆，则
+\begin{equation}
+\mathcal N_k=(W^\top)^{-k}\mathcal N_0,\qquad
+\dim\mathcal N_k=d-\rank(X_0).
+\end{equation}
+一般情形仍有 $\rank(X_{k+1})\le\rank(X_k)$，但只适用于本节的无输入注入线性系统。
+\end{proposition}
+\begin{proof}
+$v\in\mathcal N_k$ 当且仅当 $X_0^\top(W^\top)^kv=0$。可逆情形由线性同构得到维数不变；一般情形由矩阵乘法秩不等式得到秩不增。
+\end{proof}
+这种可逆变换不必是正交旋转，也可能包括伸缩和剪切。不可逆导致的零空间增大可能来自信息塌缩，不能直接解释为学习能力增强。
+
+\subsection{共享更新必须保护完整参考轨迹}
+\begin{proposition}[轨迹保留的充要条件]\label{prop:linear-path}
+在 $X'_0=X_0$ 下，$X'_j=X_j$ 对所有 $j=1,\ldots,K$ 成立，当且仅当 $EX_j=0$ 对所有 $j=0,\ldots,K-1$ 成立。令
+\begin{equation}
+\mathcal X_K=[X_0,WX_0,\ldots,W^{K-1}X_0],
+\end{equation}
+则
+\begin{align}\label{eq:path-intersection}
+\mathcal N_{\mathrm{path}}(K)&=\ker(\mathcal X_K^\top)
+=\bigcap_{j=0}^{K-1}\mathcal N_j,\\
+\mathcal N_{\mathrm{path}}(K+1)&\subseteq\mathcal N_{\mathrm{path}}(K).
+\end{align}
+\end{proposition}
+\begin{proof}
+若轨迹相同，下一步差为 $X'_{j+1}-X_{j+1}=(W+E)X_j-WX_j=EX_j=0$。反之，由 $X'_0=X_0$ 和各个 $EX_j=0$ 逐步归纳得到全部状态相同。拼接矩阵给出交集表示；增加约束给出嵌套关系。
+\end{proof}
+\begin{example}[方向变化不代表交集变大]
+取 $W=\begin{bmatrix}0&1\\1&0\end{bmatrix}$，$X_0=e_1$。单圈允许空间在 $\operatorname{span}(e_2)$ 和 $\operatorname{span}(e_1)$ 之间交替，但保护前两圈的共同空间已为 $\{0\}$。
+\end{example}
+
+\subsection{共享更新的延迟作用}
+展开可得
+\begin{equation}
+(W+E)^2h_0-W^2h_0=(WE+EW+E^2)h_0.
+\end{equation}
+若 $Eh_0=0$，第一圈不变而第二圈差为 $EWh_0$。更一般地，若 $EW^jh_0=0$ 对 $j=0,\ldots,q-1$ 成立，则前 $q$ 圈不变，且
+\begin{equation}
+h'_{q+1}-h_{q+1}=EW^qh_0.
+\end{equation}
+例如
+\begin{equation}
+W=\begin{bmatrix}1&0&0\\0&0&0\\0&1&1\end{bmatrix},\qquad
+P=\diag(0,0,1),\qquad E=\alpha P.
+\end{equation}
+旧输入 $e_1$ 在所有圈保持不变；新输入 $e_2$ 第一圈到达 $e_3$，第二圈更新前为 $e_3$，更新后为 $(1+\alpha)e_3$。这只证明状态条件的延迟作用可以存在，不证明答案更准确，也不支持“浅圈存旧知识、深圈存新知识”的必然分工。
+
+\section{从轨迹保护到最终输出的一阶保护}\label{sec:function}
+\subsection{矩阵幂差与参数 Jacobian}
+冻结读出 $C\in\RR^{c\times d}$，记 $Y_K=CW^KX_0$。
+\begin{lemma}[有限扰动的精确展开]\label{lem:telescoping}
+对任意相同尺寸的方阵 $W,E$ 和正整数 $K$，
+\begin{equation}\label{eq:exact-power}
+(W+E)^K-W^K=\sum_{j=0}^{K-1}(W+E)^{K-1-j}EW^j.
+\end{equation}
+\end{lemma}
+\begin{proof}
+将每项写为 $(W+E)^{K-j}W^j-(W+E)^{K-1-j}W^{j+1}$，相邻项抵消后只剩 $(W+E)^K-W^K$。不需要假设 $WE=EW$。
+\end{proof}
+因此固定有限 $K$ 时，
+\begin{align}
+Y'_K-Y_K&=C\sum_{j=0}^{K-1}(W+E)^{K-1-j}EW^jX_0,\\
+&=C\sum_{j=0}^{K-1}W^{K-1-j}EW^jX_0+O(\norm{E}_F^2).
+\end{align}
+利用 $\vecop(AEB)=(B^\top\otimes A)\vecop(E)$ 得
+\begin{equation}\label{eq:linear-jacobian}
+J_K=\sum_{j=0}^{K-1}\left[(W^jX_0)^\top\otimes CW^{K-1-j}\right]
+\in\RR^{cn\times d^2},
+\end{equation}
+\begin{equation}
+\vecop(Y'_K-Y_K)=J_K\vecop(E)+O(\norm{E}_F^2).
+\end{equation}
+输出的一阶允许空间为 $\mathcal F_K=\ker(J_K)\subseteq\RR^{d^2}$，且
+\begin{equation}\label{eq:linear-inclusion}
+\{\vecop(E):E\mathcal X_K=0\}\subseteq\mathcal F_K.
+\end{equation}
+反向包含一般不成立。输入空间 $\mathcal N_{\mathrm{path}}(K)$ 不能直接与参数空间 $\mathcal F_K$ 写包含关系。
+
+\subsection{跨圈抵消不是有限步零遗忘}
+\begin{example}[一阶抵消与二阶残差]\label{ex:cancellation}
+令 $W=\diag(1,-1)$，$D=\begin{bmatrix}0&1\\1&0\end{bmatrix}$，$E=\varepsilon D$，$C=X_0=I$。由于 $WD+DW=0$，有 $J_2\vecop(D)=0$，但
+\begin{equation}
+(W+\varepsilon D)^2-W^2=\varepsilon^2I.
+\end{equation}
+第一圈不存在这种抵消；第三圈的一阶变化为
+\begin{equation}
+W^2D+WDW+DW^2=D\ne0.
+\end{equation}
+因此 $\vecop(D)\notin\mathcal F_1$、$\vecop(D)\in\mathcal F_2$、$\vecop(D)\notin\mathcal F_3$。函数零空间没有轨迹交集那样的一般嵌套规律。
+\end{example}
+若同时保护多个出口，需叠加约束：
+\begin{equation}\label{eq:multi-output}
+J_{\mathcal K}=\begin{bmatrix}J_{K_1}\\\vdots\\J_{K_s}\end{bmatrix},
+\qquad \ker(J_{\mathcal K})=\bigcap_{K\in\mathcal K}\ker(J_K).
+\end{equation}
+增加保护出口只会加强一阶约束，但这不同于单个出口 $\mathcal F_K$ 随 $K$ 的变化。抵消也可能让新任务对相同方向不敏感，故函数零空间较大本身不是新任务收益。
+
+\section{推广到共享循环 Transformer}\label{sec:nonlinear}
+\subsection{共享参数影响的递推展开}
+在假设~\ref{ass:coords}~下，初始状态与读出不依赖可更新坐标 $\vartheta$。在固定检查点及输入上定义
+\begin{equation}
+H_k=\frac{\partial F_\vartheta(h_k;\xi)}{\partial h_k},\quad
+T_k=\frac{\partial F_\vartheta(h_k;\xi)}{\partial\vartheta},\quad
+Q_K=\frac{\partial G(h_K)}{\partial h_K}.
+\end{equation}
+$T_k$ 是固定 $h_k$ 时的偏导，不包括此前状态的间接传播。微分满足
+\begin{equation}
+\delta h_{k+1}=H_k\delta h_k+T_k\delta\vartheta,\qquad \delta h_0=0.
+\end{equation}
+逐步代入得
+\begin{equation}\label{eq:nonlinear-jacobian}
+J_K=Q_K\sum_{j=0}^{K-1}(H_{K-1}\cdots H_{j+1})T_j.
+\end{equation}
+空乘积为单位映射。多个输入和输出位置的 Jacobian 按行叠加。若输出取中心化 logits，则 $Q_K$ 还包含中心化映射。该式区分每圈参数的局部作用与后续传播，允许增强和抵消，但不保证其有利于新任务。
+
+\subsection{参考轨迹保护的充分条件}
+对目标物理层 $\ell$，收集固定参考上下文中需要保护的全部调用输入：
+\begin{equation}\label{eq:activation-stack}
+X_\ell^{(K)}=\operatorname{Concat}_{x,\,0\le k<K,\,j}[a_{\ell,k,j}(x)].
+\end{equation}
+\begin{proposition}[确定性计算图的参考输出保留]\label{prop:graph-exact}
+将有限次循环展开为确定性计算图。若初始输入与全部非目标运算不变，且每个目标线性层增量满足
+\begin{equation}
+\Delta W_\ell X_\ell^{(K)}=0,
+\end{equation}
+其中 $X_\ell^{(K)}$ 覆盖更新前参考图中该层的\emph{每一次相关调用}，则更新后这些参考图的所有中间节点及输出不变。
+\end{proposition}
+\begin{proof}
+按展开图的拓扑顺序归纳。输入节点相同。若某节点全部父节点相同，冻结运算的输出自然相同；目标线性运算输入为参考激活 $a$，其输出差为 $\Delta W_\ell a=0$。因此该节点也相同，归纳直至输出。残差与注意力不会破坏论证，只要其输入与非目标参数相同。
+\end{proof}
+\begin{corollary}[轨迹约束蕴含一阶输出约束]\label{cor:graph-inclusion}
+在上述条件与可微性下，不带低秩限制的参数方向空间
+\begin{equation}
+\mathcal T_K=\{\delta\vartheta:\Delta W_\ell X_\ell^{(K)}=0,\;\ell\in\mathcal S\}
+\end{equation}
+满足 $\mathcal T_K\subseteq\ker(J_{\mathrm{old},K})$，且
+\begin{equation}\label{eq:path-param-dim}
+\dim\mathcal T_K=\sum_{\ell\in\mathcal S}d_{\mathrm{out},\ell}
+\left(d_{\mathrm{in},\ell}-\rank X_\ell^{(K)}\right).
+\end{equation}
+\end{corollary}
+\begin{proof}
+对任意 $\delta\vartheta\in\mathcal T_K$，缩放增量 $\alpha\Delta W_\ell$ 仍满足命题~\ref{prop:graph-exact}，故输出沿该直线不变。在 $\alpha=0$ 处求导得到 Jacobian 为零。各独立权重块的约束按行分离，维数相加即得式~\eqref{eq:path-param-dim}。
+\end{proof}
+\begin{remark}[保证范围]
+结论限于指定检查点、参考上下文与被覆盖的深度。只保护答案 token 的少量激活、只采样最后一圈或使用截断基，都不满足完整覆盖。Teacher-forcing 的参考输出不变不自动保证自由生成序列不变，更不保证整个旧任务分布零遗忘。只保护到 $\Kpr$，不能宣称更深出口已被保护。
+\end{remark}
+
+\subsection{近似局部误差怎样传播到输出}
+将展开网络写成 $z_{s+1}=f_s(z_s)$，$s=0,\ldots,N-1$。$z_s$ 可包含后续所需的残差、固定输入和缓存，成为完整计算状态。更新运算为 $f'_s$。假设 $f'_s$ 在相关区域满足 Lipschitz 常数 $L_s$，定义
+\begin{equation}
+\epsilon_s=\norm{f'_s(z_s)-f_s(z_s)},\qquad d_s=\norm{z'_s-z_s}.
+\end{equation}
+三角不等式给出 $d_{s+1}\le L_sd_s+\epsilon_s$。由 $d_0=0$ 归纳得到
+\begin{equation}\label{eq:propagation-bound}
+d_N\le\sum_{s=0}^{N-1}\left(\prod_{v=s+1}^{N-1}L_v\right)\epsilon_s.
+\end{equation}
+若原子运算仅为目标线性映射，直接扰动是 $\Delta W_\ell a_s$；冻结原子运算的 $\epsilon_s=0$。输出头若不包含于上述 $N$ 个运算，右侧还需乘其 Lipschitz 常数。局部误差可能被后续计算放大；未估计这些常数时，不能声称已得到紧致任务遗忘界。
+
+\section{跨循环共享的受约束低秩更新（Method）}\label{sec:method}
+\subsection{历史保护基与近似零空间}
+阶段 $t$ 开始时保存正交基 $U_{\ell,t-1}\in\RR^{d_{\mathrm{in},\ell}\times m_{\ell,t-1}}$，定义
+\begin{equation}\label{eq:projector}
+P_{\ell,t-1}=I-U_{\ell,t-1}U_{\ell,t-1}^\top.
+\end{equation}
+理想完整历史激活矩阵是当前检查点上全部旧参考轨迹的 $X_{\ell,<t}^{(\Kpr)}$；无回放训练实际仅持有过去阶段形成的 $U$，因此不无条件假定 $P_{\ell,t-1}X_{\ell,<t}^{(\Kpr)}=0$。大量激活可能满秩，严格零空间为空，实践主要使用\emph{近似}允许方向。
+
+\subsection{始终保持参数化约束}
+定义阶段增量
+\begin{equation}\label{eq:projected-lora}
+\boxed{\Delta W_{\ell,t}=s_\ell B_{\ell,t}A_{\ell,t}P_{\ell,t-1}},
+\end{equation}
+其中 $A_{\ell,t}\in\RR^{r\times d_{\mathrm{in},\ell}}$，$B_{\ell,t}\in\RR^{d_{\mathrm{out},\ell}\times r}$。每圈目标层执行
+\begin{equation}\label{eq:layer-forward}
+a\longmapsto W_{\ell,t-1}a+s_\ell B_{\ell,t}A_{\ell,t}
+\bigl(a-U_{\ell,t-1}(U_{\ell,t-1}^\top a)\bigr).
+\end{equation}
+同一物理层的 $A,B,U$ 在所有圈共享，既无 per-loop LoRA，也无 per-loop 投影。主干接收完整输入，仅增量分支接收投影输入；不必构造稠密 $P$。有
+\begin{equation}
+\rank(\Delta W_{\ell,t})\le r,\qquad \Delta W_{\ell,t}U_{\ell,t-1}=0.
+\end{equation}
+阶段内冻结历史基和已合并权重，仅优化
+\begin{equation}\label{eq:method-objective}
+\min_{\phi_t}\mathcal L_t\bigl(\Theta_{t-1}+\Delta\Theta(\phi_t);\Ktr\bigr),
+\qquad\phi_t=\{A_{\ell,t},B_{\ell,t}\}_{\ell\in\mathcal S}.
+\end{equation}
+初始化 $B=0$ 使增量为零，$A$ 使用固定种子的标准随机初始化。第一任务 $U_{\ell,0}$ 为空，$P_{\ell,0}=I$。
+\begin{remark}[约束与优化器]
+只在初始化时投影 $A$、随后自由更新，不保证式~\eqref{eq:projected-lora}。梯度投影后再经 Adam 预条件化，实际更新也可能离开原空间。本文选择前向显式参数化，避免依赖优化器保持约束；这不意味着因子优化等于理想欧氏投影梯度。
+\end{remark}
+
+\subsection{局部保护误差与历史漂移}
+对任意参考激活矩阵 $X$，由范数次乘性
+\begin{equation}\label{eq:local-error}
+\norm{\Delta W_{\ell,t}X}_F\le |s_\ell|\norm{B_{\ell,t}A_{\ell,t}}_2
+\norm{P_{\ell,t-1}X}_F.
+\end{equation}
+若 $X_{\mathrm{stored}}$ 为构造历史统计时的激活，$X_{\mathrm{current}}$ 为相同上下文在当前模型中的激活，则
+\begin{equation}\label{eq:stale-bound}
+\norm{PX_{\mathrm{current}}}_F\le\norm{PX_{\mathrm{stored}}}_F+
+\norm{X_{\mathrm{current}}-X_{\mathrm{stored}}}_F,
+\end{equation}
+因为 $\norm{P}_2\le1$。近似保护受到统计截断与表征漂移双重影响。$X_{\mathrm{stored}}$ 是分析对象，不代表训练器实际保存历史激活或输入。实测漂移若需旧样本访问，应放入不反馈训练的独立诊断并披露。
+
+\subsection{阶段合并：避免刷新投影时改写历史}
+阶段结束后执行
+\begin{equation}\label{eq:merge}
+W_{\ell,t}=W_{\ell,t-1}+\Delta W_{\ell,t}.
+\end{equation}
+下一任务重新初始化零输出的新分支，投影变化只作用于新增量。若在未合并累计分支中直接将 $BAP_{t-1}$ 换成 $BAP_t$，即使不做梯度更新，模型也已改变。
+固定活动 rank 不等于固定累计 rank：
+\begin{equation}\label{eq:rank-accum}
+\rank(W_{\ell,t}-W_{\ell,0})\le\min\{d_{\mathrm{out},\ell},d_{\mathrm{in},\ell},tr\}.
+\end{equation}
+不需要按任务增加推理分支，单份合并权重形状不变，但不能声称全部历史更新始终为 rank $r$。数值合并需检验前后输出一致性。匹配对照使用相同分支、合并和优化器重置协议，仅将 $P$ 替换为 $I$。
+
+\subsection{一种明确的历史基维护规则}\label{subsec:memory}
+以下增量规则保留已存历史方向，不用未定义的压缩黑盒隐藏遗忘。任务 $t$ 合并后，用固定当前训练统计子集，在深度 $\Kpr$ 收集 $\widehat X_{\ell,t}$。令
+\begin{equation}
+R_{\ell,t}=(I-U_{\ell,t-1}U_{\ell,t-1}^\top)\widehat X_{\ell,t}.
+\end{equation}
+对残差作薄 SVD，左奇异向量为 $V$，奇异值为 $\sigma_1\ge\cdots\ge0$。给定残差比例 $\varepsilon_{\mathrm{mem}}\in[0,1]$，选择最小 $q$ 满足
+\begin{equation}\label{eq:memory-threshold}
+\sum_{v>q}\sigma_v^2\le\varepsilon_{\mathrm{mem}}\norm{\widehat X_{\ell,t}}_F^2,
+\qquad m_{\ell,t-1}+q\le m_{\ell,\max}.
+\end{equation}
+若存在可行 $q$，令
+\begin{equation}
+U_{\ell,t}=\Orth([U_{\ell,t-1},V_{:,1:q}]).
+\end{equation}
+仅追加非零残差方向，重正交化以控制数值误差；零统计矩阵不追加。若预算内无可行 $q$，标记饱和，可追加剩余容量内的最大允许方向数，但必须报告实际残差，不宣称已满足阈值，也不静默删除旧方向。
+等维数消融使用预先规定的累计容量，同样截断残差 SVD，并报告实际保留能量；等能量消融固定 $\varepsilon_{\mathrm{mem}}$，报告不同存储量。两种试验分别从头维护历史基，不在同一模型中反复删除旧方向后继续宣称相同保护条件。
+若每个基元素占 $b$ 字节，历史基存储为
+\begin{equation}
+M_U=b\sum_{\ell\in\mathcal S}d_{\mathrm{in},\ell}m_{\ell,t}.
+\end{equation}
+活动适配器参数数为
+\begin{equation}
+N_{\mathrm{adapter}}=\sum_{\ell\in\mathcal S}r(d_{\mathrm{in},\ell}+d_{\mathrm{out},\ell}),
+\end{equation}
+与循环数无关。临时激活、SVD、优化器状态、训练激活和离线归档另行计费，$M_U$ 不代表全部内存。
+
+\subsection{训练算法}
+\begin{enumerate}[label=\arabic*.]
+\item 固定 revision、目标物理层、$\Ktr,\Kpr$、rank、模板和统计规则，令 $U_{\ell,0}=\varnothing$。
+\item 阶段 $t$ 冻结历史权重和基，初始化一份跨圈共享的新分支，令 $B_{\ell,t}=0$。
+\item 仅用当前训练数据优化式~\eqref{eq:method-objective}，始终使用式~\eqref{eq:layer-forward}，固定最终出口，训练缓存关闭。
+\item 按式~\eqref{eq:merge}~合并增量，检验数值误差，保存独立评估用检查点。
+\item 在合并模型上收集当前训练统计子集的前 $\Kpr$ 圈输入，按第~\ref{subsec:memory}~节更新历史基。
+\item 释放统计原始样本和临时激活，仅将合并模型及允许的统计状态传给下一阶段。评估归档不成为训练器可访问的回放库。
+\end{enumerate}
+
+\section{理想函数保护与实际低秩训练的区别}\label{sec:geometry}
+\subsection{旧输出对象与局部参数空间}
+在同一检查点上，用固定参考上下文、token 位置和保护出口定义旧输出向量
+\begin{equation}
+f_{\mathrm{old},K}(\vartheta)=\operatorname{Concat}\left[
+\left(I-\frac{\mathbf1\mathbf1^\top}{V}\right)z_{\vartheta,K}\right],
+\end{equation}
+$V$ 为词表大小，括号作用于每个位置的 logits。也可研究概率向量，但必须保持保护对象一致。记 $J_{\mathrm{old},K}=\partial f_{\mathrm{old},K}/\partial\vartheta$；多出口时按式~\eqref{eq:multi-output}~叠加成 $J_{\mathrm{pr}}$。
+\begin{assumption}[局部光滑性]\label{ass:smooth}
+在有限更新的相关邻域内，旧参考输出可微且 Jacobian 为 $\beta$-Lipschitz；新任务损失的梯度为 $L$-Lipschitz。常数可依赖检查点、输入和深度，不预设为深度无关常数。
+\end{assumption}
+Taylor 展开给出
+\begin{equation}\label{eq:old-remainder}
+\norm{f_{\mathrm{old}}(\vartheta+\delta)-f_{\mathrm{old}}(\vartheta)-J_{\mathrm{pr}}\delta}_2
+\le\frac{\beta}{2}\norm{\delta}_2^2.
+\end{equation}
+即便 $J_{\mathrm{pr}}\delta=0$，也仅有二阶输出变化界，不是任意有限步精确保留。
+
+\subsection{理想投影步及其下降性质}
+定义 Moore--Penrose 伪逆下的正交投影
+\begin{equation}\label{eq:function-projector}
+\Pi_{\mathrm{pr}}=I-J_{\mathrm{pr}}^\dagger J_{\mathrm{pr}}.
+\end{equation}
+令 $g_K=\nabla_\vartheta\mathcal L_t(\vartheta;K)$，考虑\emph{仅用于理论分析}的问题
+\begin{equation}\label{eq:ideal-step}
+\min_\delta\inner{g_K}{\delta}+\frac{1}{2\eta}\norm{\delta}_2^2
+\quad\text{s.t.}\quad J_{\mathrm{pr}}\delta=0.
+\end{equation}
+\begin{proposition}[理想受保护下降]\label{prop:descent}
+式~\eqref{eq:ideal-step}~在 $\eta>0$ 下的唯一解为 $\delta^*=-\eta\Pi_{\mathrm{pr}}g_K$。在假设~\ref{ass:smooth}~下，
+\begin{equation}\label{eq:descent-bound}
+\mathcal L_t(\vartheta+\delta^*;K)-\mathcal L_t(\vartheta;K)
+\le-\eta\left(1-\frac{L\eta}{2}\right)\norm{\Pi_{\mathrm{pr}}g_K}_2^2.
+\end{equation}
+若 $0<\eta<2/L$ 且投影梯度非零，则局部损失严格下降。
+\end{proposition}
+\begin{proof}
+把 $g_K$ 分解为核空间分量和正交补，可行 $\delta$ 只与前者有内积，配方得到唯一极小点。由 $\Pi_{\mathrm{pr}}^\top=\Pi_{\mathrm{pr}}^2=\Pi_{\mathrm{pr}}$，有 $\inner{g_K}{\delta^*}=-\eta\norm{\Pi_{\mathrm{pr}}g_K}_2^2$，代入光滑性下降引理即得结果。
+\end{proof}
+定义相容性比例
+\begin{equation}\label{eq:function-q}
+q_{K\mid\mathrm{pr}}=\frac{\norm{\Pi_{\mathrm{pr}}g_K}_2^2}{\norm{g_K}_2^2},
+\qquad g_K\ne0.
+\end{equation}
+零梯度时记为不可用。比例较大不保证绝对下降更多，还需考虑梯度范数、曲率、可实现的低秩方向及资源开销。
+
+\subsection{训练深度和评估深度不同的必要修正}\label{subsec:cross-depth}
+固定评估出口 $\Kev$，令 $g_{\mathrm{ev}}=\nabla_\vartheta\mathcal L_t(\vartheta;\Kev)$。训练深度 $K$ 产生的理想更新在评估出口的效果为
+\begin{equation}\label{eq:cross-depth}
+\begin{split}
+&\mathcal L_t(\vartheta-\eta\Pi_{\mathrm{pr}}g_K;\Kev)-\mathcal L_t(\vartheta;\Kev)\\
+&\quad=-\eta\inner{g_{\mathrm{ev}}}{\Pi_{\mathrm{pr}}g_K}
++O\left(\eta^2\norm{\Pi_{\mathrm{pr}}g_K}_2^2\right).
+\end{split}
+\end{equation}
+\textbf{只有梯度对应同一目标且 $K=\Kev$ 时，一阶项才化为投影梯度的平方范数。} 因而高 $q_{K\mid\mathrm{pr}}$ 不保证固定测试出口下更好。可同时记录
+\begin{equation}
+c_{K\to\Kev\mid\mathrm{pr}}=\frac{\inner{g_{\mathrm{ev}}}{\Pi_{\mathrm{pr}}g_K}}
+{\norm{g_{\mathrm{ev}}}_2\norm{\Pi_{\mathrm{pr}}g_K}_2},
+\end{equation}
+仅在分母非零时定义。实际候选更新则直接测量 $-\inner{g_{\mathrm{ev}}}{\delta}$ 与真实评估损失变化。
+
+\subsection{激活投影是不同的代理几何}
+定义矩阵块算子
+\begin{equation}
+\mathcal P_{\mathrm{act}}(G)=\{G_\ell P_{\ell,t-1}\}_{\ell\in\mathcal S}.
+\end{equation}
+该算子在块 Frobenius 内积下投影到 $E_\ell U_{\ell,t-1}=0$ 的线性空间。诊断量为
+\begin{equation}\label{eq:activation-q}
+q_K^{\mathrm{act}}=\frac{\sum_\ell\norm{G_{\ell,K}P_{\ell,t-1}}_F^2}
+{\sum_\ell\norm{G_{\ell,K}}_F^2}.
+\end{equation}
+它不同于式~\eqref{eq:function-q}。只有理想完整轨迹条件下，激活约束方向才包含于对应输出的一阶核空间；截断与历史漂移会破坏这一保证。再加 rank $\le r$ 限制后，可行集合一般不是线性子空间。
+
+\subsection{LoRA 因子坐标不能冒充有效权重坐标}
+令 $G=\partial\mathcal L/\partial E$、$E=sBAP$，$P$ 固定。微分与梯度为
+\begin{align}\label{eq:lora-gradients}
+\mathrm dE&=s(\mathrm dB\,AP+B\,\mathrm dA\,P),\\
+\nabla_A\mathcal L&=sB^\top GP,\qquad
+\nabla_B\mathcal L=sGPA^\top.
+\end{align}
+因此 $B=0$ 时 $\nabla_A\mathcal L=0$，一阶可达方向受 $AP$ 行空间限制，并非整个激活允许空间。令 $D_\phi=\partial\vartheta/\partial\phi$，则
+\begin{equation}
+J_\phi=J_\vartheta D_\phi.
+\end{equation}
+因子缩放 $A\mapsto cA$、$B\mapsto B/c$ 保持有效权重不变，却改变欧氏梯度几何。跨深度应固定坐标、初始化与优化器协议，同时报告有效更新范数和实际损失变化，不能将因子退化解释为零空间机制。
+
+\subsection{近似 Jacobian 的边界}
+若只持有 $\widehat J$，且 $\norm{J-\widehat J}_2\le\xi_J$、$\norm{\widehat J\delta}_2\le\epsilon_J$，则
+\begin{equation}
+\norm{f_{\mathrm{old}}(\vartheta+\delta)-f_{\mathrm{old}}(\vartheta)}_2
+\le\epsilon_J+\xi_J\norm{\delta}_2+\frac{\beta}{2}\norm{\delta}_2^2.
+\end{equation}
+未知 $\xi_J$ 时，该式是条件性分析，不是已认证误差界。不能用旧任务标量 loss 梯度替代全部输出 Jacobian；教师与学生相同处标量 KL 的一阶梯度为零，也不能据此构造输出保护空间。完整 Jacobian 不属于实际训练器，可用小样本 JVP/VJP 或低秩近似作独立诊断，并报告近似秩和误差。
+
+\section{与数学对象一致的实验协议}\label{sec:experiments}
+\subsection{固定深度主实验}
+以 Ouro-1.4B 为候选，先验收固定出口、层调用次数、共享适配器、梯度和缓存，再在 TRACE\cite{trace} 上检查单任务可学习性。主比较设置
+\begin{equation}
+\Ktr\in\{1,2,3,4\},\qquad\Kpr=4,\qquad\Kev=4.
+\end{equation}
+各深度分支从同一原始模型开始，之后会形成不同权重与历史基。因此最终差异是\emph{整条学习过程}的效果，不替代同检查点分析。首轮自定义任务流为
+\begin{equation}
+\mathrm{FOMC}\to\mathrm{ScienceQA}\to
+\mathrm{NumGLUE\text{-}cm}\to\mathrm{NumGLUE\text{-}ds}.
+\end{equation}
+此子集不是官方完整 TRACE。抽样上限、样本 ID、种子、模板和长度策略在正式测试前固定；ScienceQA 使用 TRACE 纯文本版本并保留解释。未核实名称和来源的其他数据集不纳入本稿设定。
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\textwidth}{p{0.29\textwidth}YY}
+\toprule 方法 & 任务间处理 & 约束\\\midrule
+Sequential-LoRA & 同一分支持续训练 & 无投影\\
+Incremental-LoRA & 新分支、合并、重置优化器 & $P=I$\\
+Projected-Incremental-LoRA & 相同新增、合并和重置协议 & 阶段内固定历史 $P$\\
+\bottomrule
+\end{tabularx}
+\caption{主要归因比较是后两行；方法名是实现描述，不是新颖性声明。}
+\end{table}
+
+\subsection{同检查点的反事实小更新}
+同一检查点 $\vartheta$ 上固定旧参考上下文、新任务训练批次和保护基，对不同 $K$ 独立构造候选有效更新 $\delta_K$。每次恢复原模型和优化器状态，分别比较同学习率和同更新范数：
+\begin{equation}
+\norm{\delta_K}_2^2=\sum_\ell\norm{\Delta W_{\ell,K}}_F^2=\rho^2.
+\end{equation}
+零更新单独记录，不除以零归一化。使用多个预定的小 $\rho$ 检查一阶有效范围。在与梯度批次分离的新任务训练 probe 上测量
+\begin{equation}
+\Delta\mathcal L_{\mathrm{new}}(K)=\mathcal L_{\mathrm{probe}}(\vartheta;\Kev)
+-\mathcal L_{\mathrm{probe}}(\vartheta+\delta_K;\Kev),
+\end{equation}
+在固定旧参考上下文和位置上测量
+\begin{equation}
+D_{\mathrm{old}}(K)=\frac{1}{|\mathcal C|}\sum_{c\in\mathcal C}
+\KL\left(p_{\vartheta,\Kev}(\cdot\mid c)\,\|\,
+p_{\vartheta+\delta_K,\Kev}(\cdot\mid c)\right).
+\end{equation}
+二维权衡图比只报告 $q$ 更直接；固定出口的解释须考虑式~\eqref{eq:cross-depth}。这些反事实试探不默认为正式训练的深度控制器，旧样本分析也不向训练器反馈结果。
+
+\subsection{评价与公平性}
+记 $R_{t,i}^{(\Ktr,\Kev)}$ 为学完任务 $t$ 后在任务 $i$ 上的原生分数，同时记录初始值 $R_{0,i}$。例如常见 BWT 为
+\begin{equation}
+\mathrm{BWT}_t=\frac{1}{t-1}\sum_{i=1}^{t-1}(R_{t,i}-R_{i,i}),\qquad t>1.
+\end{equation}
+需明确标注所用定义；若复现 TRACE 的不同归一化，单独实现并命名，不混用。宏平均需统一数值尺度并保留原生指标，不把异质指标平均称为统一准确率。
+\begin{itemize}
+\item 同 token 数与同训练 FLOPs 分开比较；固定测试深度并另报吞吐和延迟，计入保护统计、投影、诊断及任何搜索成本。
+\item 固定保护维数与固定能量阈值分别比较；保护深度和训练深度消融分离。截断子空间不保证具有精确轨迹空间的嵌套性。
+\item 报告新任务增益与旧任务退化，避免将学不动造成的低遗忘当作成功；补冻结模型和单任务适应参考。
+\item 固定反传规则、rank、注入位置、分支重置和合并协议；记录数值误差、累计有效 rank 和历史存储。
+\item 补多种训练种子与预定任务顺序。Ouro 一圈出口不等于独立预训练的普通 Transformer 对照。
+\item 不预先承诺 GPU 天数、显存或效果；独立旧样本诊断不反馈给训练器，额外数据访问如实披露。
+\end{itemize}
+
+\section{待检验假设与创新边界}\label{sec:claims}
+\begin{description}[style=nextline]
+\item[H1：几何具有深度依赖。]同检查点、同输入下，单圈保护方向或输出 Jacobian 的核空间发生可测变化。累计轨迹空间必然嵌套本身不算新发现。
+\item[H2：变化与受保护学习有效性相关。]不同深度的候选更新在等范数、固定出口下呈现不同的新任务下降和旧输出扰动权衡，且不只来自梯度大小。
+\item[H3：上述效应体现为持续学习收益。]匹配方法协议、保护和计算预算后，任务流上仍有稳定的学习与保持改善。
+\end{description}
+H1 不推出 H2，H2 不推出 H3。空间变化、参数共享或理论可行性本身不保证收益。若只有更多计算带来的提高、空间饱和后学不动，或诊断与真实更新效果无关，应如实报告，不用增加控制器掩盖负结果。
+循环模型、低秩更新与正交保护均有先例\cite{huginn,ouro,lora,gpm,inflora,controlled,alphaedit}。本稿不宣称组件组合的首次性；潜在贡献是\emph{系统检验循环深度、保护几何和新任务有效学习方向的关系}。自适应训练深度、函数 Jacobian 训练约束及任务专属推理路由均不属于当前核心算法。
+
+\appendix
+\section{实现与数学的对齐清单}
+\begin{enumerate}
+\item Ouro 圈数涉及配置和模型实例缓存字段；修改后验证实际物理层调用次数，而不是只打印配置。
+\item 已核查 Ouro-1.4B revision 的默认 \texttt{labels} 路径使用多出口加权 logits。固定最终出口训练应显式获取最后一圈 logits，在外部计算所定义的 loss；推理早退阈值不等价于训练目标开关。
+\item 外部 causal loss 仅移位一次：第 $j$ 位置 logits 预测第 $j+1$ 个 token。不要重复移位或把 Huginn 的标签语义直接移植到 Ouro。
+\item 按实际位置屏蔽 padding；EOS 与 padding 共用 ID 时不能屏蔽全部 EOS。验证有无 padding 的有效位置前向一致性。
+\item 每个物理层仅建立一份适配器，用调用计数与参数对象身份确认共享，冻结所有未定义为可训练的模块。
+\item $B=0$ 时第一步 $A$ 梯度为零符合式~\eqref{eq:lora-gradients}；需检查 $B$ 梯度、后续 $A$ 梯度和有效更新。
+\item 单独验收检查点重计算、混合精度、合并一致性；训练禁用缓存，推理缓存按循环位置区分并与无缓存对照。
+\item 保存 revision、超参数、统计规则与样本 ID；数学推导不替代真实 checkpoint 的梯度和任务指标验收。
+\end{enumerate}
+
+\section{可复现的数值核对}
+配套脚本 \path{tests/test_loop_depth_math.py} 包含 12 项小矩阵检查，使用固定随机种子，包括局部投影与 rank、可逆空间传输、路径交集收缩、延迟作用、非交换矩阵幂展开、按列向量化 Jacobian、跨圈抵消、非线性递推有限差分、理想投影下降、跨出口反例、LoRA 因子导数与历史基增量维护。当前 12 项均通过所设容差；这些数值检查只用于排除实现和符号错误，不替代一般性证明，也不是 Ouro 或持续学习性能实验。复现命令：
+\begin{quote}\ttfamily
+python -m unittest discover -s tests -p test\_loop\_depth\_math.py -v
+\end{quote}
+
+\section{结论边界速查}
+\begin{longtable}{p{0.43\textwidth}p{0.49\textwidth}}
+\toprule 有条件成立的结论 & 不能直接升级成的结论\\\midrule\endhead
+参考激活满足 $\Delta W X=0$ & 整个旧任务分布零遗忘\\
+完整确定性参考图所有修改处均精确保留 & 未覆盖生成前缀或更深出口也不变\\
+$J\delta=0$ & 有限步更新后输出完全不变\\
+单圈输入空间方向变化 & 更多循环必然扩大路径允许空间\\
+$q_K$ 较高 & 低秩 Adam 或另一评估出口一定更好\\
+活动 rank 固定与参数共享 & 累计 rank、历史存储、计算均固定\\
+同 token 数条件下更好 & 同 FLOPs 条件下也更好\\
+组件结合具有动机 & 已证明首次性或取得实验收益\\
+\bottomrule
+\end{longtable}
+
+\clearpage
+\begin{thebibliography}{99}
+\raggedright
+\addcontentsline{toc}{section}{参考文献与实现入口}
+\bibitem{ouro} Zhu et al. Scaling Latent Reasoning via Looped Language Models. arXiv:2510.25741, 2025.
+\url{https://arxiv.org/abs/2510.25741}.
+模型：\url{https://huggingface.co/ByteDance/Ouro-1.4B}；本稿核查 revision：\nolinkurl{574fa66cb8bf5abdc979642d01cf2b79b16bfab1}。
+\bibitem{huginn} Geiping et al. Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach. arXiv:2502.05171, 2025.
+\url{https://arxiv.org/abs/2502.05171}.
+\bibitem{trace} Wang et al. TRACE: A Comprehensive Benchmark for Continual Learning in Large Language Models. arXiv:2310.06762, 2023.
+\url{https://arxiv.org/abs/2310.06762}.
+官方数据与评估：\url{https://github.com/BeyonderXX/TRACE}；本稿核查 revision：\nolinkurl{462e39f616134f4f819efeb3baea8638c03c7db4}。
+\bibitem{lora} Hu et al. LoRA: Low-Rank Adaptation of Large Language Models. arXiv:2106.09685, 2021.
+\url{https://arxiv.org/abs/2106.09685}.
+\bibitem{gpm} Saha, Garg, and Roy. Gradient Projection Memory for Continual Learning. arXiv:2103.09762, 2021.
+\url{https://arxiv.org/abs/2103.09762}.
+\bibitem{inflora} Liang et al. InfLoRA: Interference-Free Low-Rank Adaptation for Continual Learning. CVPR, 2024.
+\href{https://openaccess.thecvf.com/content/CVPR2024/html/Liang_InfLoRA_Interference-Free_Low-Rank_Adaptation_for_Continual_Learning_CVPR_2024_paper.html}{CVF Open Access 论文入口}。
+\bibitem{controlled} Controlled Low-Rank Adaptation with Subspace Regularization for Continued Training on Large Language Models. ACL, 2025.
+\url{https://aclanthology.org/2025.acl-long.940/}.
+\bibitem{alphaedit} AlphaEdit: Null-Space Constrained Knowledge Editing for Language Models. arXiv:2410.02355, 2024.
+\url{https://arxiv.org/abs/2410.02355}.
+\end{thebibliography}
+\end{document}

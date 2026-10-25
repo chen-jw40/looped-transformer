@@ -1,0 +1,40 @@
+#!/bin/bash
+#PBS -N ouro_base
+#PBS -q regular-g
+#PBS -W group_list=gn77
+#PBS -l select=1
+#PBS -l walltime=12:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:-$PWD}"
+
+# 以下为 Python 配置；PBS_DRY_RUN=1 时仅打印解析结果，不申请/启动 GPU 进程。
+python3 - <<'PYCONFIG'
+import os
+from scripts.pbs_launch import launch
+
+# 未训练模型的评测参数；该作业不执行训练。
+CONFIG = {
+    "output_dir": os.environ.get("RUN_DIR", "runs/new_base_k4"),
+    "model": "models/Ouro-1.4B",
+    "data_root": "data/TRACE/TRACE-Benchmark/LLM-CL-Benchmark_5000",
+    "tasks": ["FOMC", "ScienceQA", "NumGLUE-cm", "NumGLUE-ds",
+              "C-STANCE", "MeetingBank", "Py150", "20Minuten"],
+    "split": "test",
+    "limit": None,  # None = 完整 split
+    "seed": 42,
+    "loop_depth": 4,
+    "max_length": 4096,
+    "truncate_long_prompts": True,
+    "batch_size": 64,
+    "gpu_memory_utilization": 0.85,
+    "temperature": 0.0,
+    "max_new_tokens": None,  # 整数会覆盖逐任务上限
+    "max_new_tokens_by_task": {
+        "FOMC": 8, "ScienceQA": 1024, "NumGLUE-cm": 32, "NumGLUE-ds": 32,
+        "C-STANCE": 8, "MeetingBank": 1024, "Py150": 256, "20Minuten": 512,
+    },
+    "dry_run": False,
+}
+launch("base", CONFIG)
+PYCONFIG

@@ -1,0 +1,61 @@
+#!/bin/bash
+#PBS -N ouro_depth
+#PBS -q regular-g
+#PBS -W group_list=gn77
+#PBS -l select=1
+#PBS -l walltime=12:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:-$PWD}"
+
+# VARIANT=trajectory/first/last/joint/joint_local; RANK=512/256/128/64; each job is one seed.
+# CODE_DIR selects a frozen source snapshot; no sensitivity statistics are used.
+python3 - <<'PYCONFIG'
+import os
+import sys
+from pathlib import Path
+
+if os.environ.get("CODE_DIR"):
+    sys.path.insert(0, os.environ["CODE_DIR"])
+from scripts.pbs_launch import launch
+from scripts.parameters import TASKS, MAX_NEW_TOKENS
+
+rank = int(os.environ.get("RANK", "64"))
+variant = os.environ.get("VARIANT", "trajectory")
+seed = int(os.environ.get("SEED", "42"))
+if rank not in (64, 128, 256, 512) or variant not in ("trajectory", "first", "last", "joint", "joint_local"):
+    raise ValueError("Expected RANK=64/128/256/512 and VARIANT=trajectory/first/last/joint/joint_local")
+run_dir = Path(os.environ.get("RUN_DIR", f"runs/new_{variant}_r{rank}_seed{seed}")).resolve()
+if run_dir.is_relative_to(Path("result").resolve()):
+    raise ValueError("New experiments must write to runs/, not result/")
+if os.environ.get("PBS_DRY_RUN") != "1" and run_dir.exists():
+    raise FileExistsError(run_dir)
+config = {
+    "method": "projected", "basis_statistic": "activation",
+    "basis_depth_mode": "task" if variant == "first" else "last" if variant == "last" else "all",
+    "route_depths": [0] * len(TASKS) if variant == "first" else None,
+    "basis_strategy": ("last_trajectory" if variant == "trajectory" else "joint_greedy" if variant == "joint"
+                       else "joint_local" if variant == "joint_local" else "append"),
+    "trajectory_floor": "tolerance", "basis_svd_method": "randomized", "history_rank": rank,
+    "basis_max_rank": rank, "basis_residual_tolerance": .05, "projection_scope": "all-linear",
+    # Fixed activation budget across ranks; the collector excludes special/pad tokens.
+    "stat_samples": 64, "stat_vectors_per_call": 16, "stat_vectors_per_layer": 1024,
+    "output_dir": str(run_dir), "model": "models/Ouro-1.4B",
+    "data_root": "data/TRACE/TRACE-Benchmark/LLM-CL-Benchmark_5000",
+    "tasks": TASKS, "seed": seed, "loops": 4, "eval_loops": 4,
+    "train_limit": 5000, "epochs": None,  # TRACE per-task 3/5/7 epochs
+    "learning_rate": 1e-5, "weight_decay": 0.,
+    "micro_batch_size": 8, "gradient_accumulation": 16, "max_length": 4096,
+    "truncate_long_prompts": True, "early_stopping": False, "early_stopping_steps": 150,
+    "early_stopping_max_evals": 6, "early_stopping_samples": 128, "early_stopping_seed": 42,
+    "early_stopping_patience": 2, "early_stopping_min_delta": .001,
+    "train_only": False, "eval_tasks": TASKS, "eval_split": "test", "eval_limit": None,
+    "checkpoint_scope": "all", "batch_size": 64, "gpu_memory_utilization": .85,
+    "temperature": 0., "max_new_tokens_by_task": MAX_NEW_TOKENS,
+    "env_file": ".env", "wandb_project": "ouro-continual-learning", "wandb_mode": "disabled",
+}
+launch("train", config)
+if os.environ.get("PBS_DRY_RUN") != "1" and os.environ.get("DEPTH_STUDY_ROOT"):
+    from scripts.depth_controls_statistics import run
+    run(Path(os.environ["DEPTH_STUDY_ROOT"]))
+PYCONFIG

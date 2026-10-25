@@ -1,0 +1,28 @@
+#!/bin/bash
+#PBS -N ouro_validate
+#PBS -q regular-g
+#PBS -W group_list=gn77
+#PBS -l select=1
+#PBS -l walltime=12:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:-$PWD}"
+
+# 以下为 Python 配置；PBS_DRY_RUN=1 时仅打印解析结果，不申请/启动 GPU 进程。
+python3 - <<'PYCONFIG'
+from scripts.pbs_launch import launch
+
+# 可选 data / gpu / model；按列表顺序检查，不执行训练。
+CHECKS = ["gpu", "model"]
+CONFIG = {
+    "data_root": "data/TRACE/TRACE-Benchmark/LLM-CL-Benchmark_5000",
+    "model": "models/Ouro-1.4B",
+    "loops": [1, 2, 4],
+    "prompt": "The future of AI is",
+    "atol": 0.05,
+    "rtol": 0.05,
+    "dry_run": False,
+}
+for kind in CHECKS:
+    launch("validate", {"kind": kind, **CONFIG})
+PYCONFIG

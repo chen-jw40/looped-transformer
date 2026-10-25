@@ -1,0 +1,8 @@
+# Downloaded model weights and configuration
+58872a72616c736595b8b7662079c5b12c5a162ec16eae94f21c348dfa9885af  models/Ouro-1.4B/model.safetensors
+ce9cc13da41591b8b4deca053d7dfee06424c0228628ee862ea86d725bc163f3  models/Ouro-1.4B/config.json
+950443e32929047aa08d02abad2e1888bc1914b3db988d3d675f70787f65dafb  models/Ouro-1.4B/configuration_ouro.py
+# Local Transformers 4.55 cache compatibility patch applied
+f51a4357ff72b1f2a6287551823e9c277e0e1cd760c680566b4f1ebe35fe6c55  models/Ouro-1.4B/modeling_ouro.py
+# Archive linked from the pinned TRACE README
+11152d50f8a093b1fc9c6c924ec207915d173b9e2d715396ec8f8a837e2668a8  data/downloads/TRACE_data.zip

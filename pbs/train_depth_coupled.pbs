@@ -1,0 +1,58 @@
+#!/bin/bash
+#PBS -N ouro_coupled
+#PBS -q regular-g
+#PBS -W group_list=gn77
+#PBS -l select=1
+#PBS -l walltime=12:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:-$PWD}"
+
+# RANK=512 / 128 matches the corresponding last-depth baseline sampling budget.
+# SMOKE=1 runs two small task stages and limited test evaluation first.
+python3 - <<'PYCONFIG'
+import os
+from pathlib import Path
+from scripts.pbs_launch import launch
+from scripts.parameters import TASKS, MAX_NEW_TOKENS
+
+rank = int(os.environ.get("RANK", "512"))
+if rank not in (128, 512):
+    raise ValueError("RANK must be 128 or 512")
+smoke = os.environ.get("SMOKE") == "1"
+config = {
+    "method": "projected", "basis_statistic": "depth_coupled",
+    "basis_depth_mode": "all", "basis_strategy": "append",
+    "basis_max_rank": rank, "basis_residual_tolerance": .05,
+    "projection_scope": "all-linear",
+    "stat_samples": 4 if smoke else 64,
+    "stat_vectors_per_call": 16 if rank == 512 else 4,
+    "stat_vectors_per_layer": 1024 if rank == 512 else 256,
+    "output_dir": os.environ.get("RUN_DIR", f"runs/new_depth_coupled_r{rank}"),
+    "model": "models/Ouro-1.4B",
+    "data_root": "data/TRACE/TRACE-Benchmark/LLM-CL-Benchmark_5000",
+    "tasks": TASKS[:2] if smoke else TASKS,
+    "seed": int(os.environ.get("SEED", "42")),
+    "loops": 4, "eval_loops": 4, "train_limit": 32 if smoke else 5000,
+    "epochs": 1 if smoke else None, "learning_rate": 1e-5, "weight_decay": 0.,
+    "micro_batch_size": 8, "gradient_accumulation": 16,
+    "max_length": 4096, "truncate_long_prompts": True,
+    "early_stopping": False, "early_stopping_steps": 1 if smoke else 150,
+    "early_stopping_max_evals": 6, "early_stopping_samples": 2 if smoke else 128,
+    "early_stopping_seed": 42, "early_stopping_patience": 2,
+    "early_stopping_min_delta": .001,
+    "eval_split": "test", "eval_limit": 2 if smoke else None,
+    "checkpoint_scope": "all", "batch_size": 64,
+    "gpu_memory_utilization": .85, "temperature": 0.,
+    "max_new_tokens_by_task": MAX_NEW_TOKENS,
+    "wandb_mode": "disabled",
+}
+launch("train", config)
+if os.environ.get("PBS_DRY_RUN") != "1" and os.environ.get("COUPLED_STUDY_ROOT"):
+    if smoke:
+        from scripts.coupled_statistics import validate_smoke
+        validate_smoke(Path(config["output_dir"]))
+    else:
+        from scripts.coupled_statistics import run
+        run(Path(os.environ["COUPLED_STUDY_ROOT"]))
+PYCONFIG

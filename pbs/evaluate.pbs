@@ -1,0 +1,42 @@
+#!/bin/bash
+#PBS -N ouro_evaluate
+#PBS -q regular-g
+#PBS -W group_list=gn77
+#PBS -l select=1
+#PBS -l walltime=12:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:-$PWD}"
+
+# 以下为 Python 配置；PBS_DRY_RUN=1 时仅打印解析结果，不申请/启动 GPU 进程。
+python3 - <<'PYCONFIG'
+import os
+from scripts.pbs_launch import launch
+
+# 已训练 checkpoint 的独立评测；训练超参数保存在 source 的 summary.json。
+# 修改评测配置时使用新的 output_dir，防止不同设置的预测混在一起。
+CONFIG = {
+    "run_dir": os.environ.get("RUN_DIR", "runs/new_train"),
+    "output_dir": os.environ.get("EVAL_DIR", "runs/new_train_test"),
+    "split": os.environ.get("SPLIT", "test"),
+    "checkpoint_scope": os.environ.get("CHECKPOINT_SCOPE", "final"),  # final / all
+    "model": None,  # None = 来源运行的 tokenizer/base；可填本地模型路径
+    "data_root": None,  # None = 来源运行的数据根目录
+    "tasks": None,  # None = 来源运行的评测任务；也可填任务名列表
+    "eval_loops": None,  # None = 来源运行的 K；整数覆盖所有任务
+    "max_length": None,  # None = 来源运行的上下文上限（通常 4096）
+    "seed": None,  # None = 来源运行 seed
+    "eval_limit": None,  # 独立输出中 None = 完整 split
+    "truncate_long_prompts": True,
+    "batch_size": 64,
+    "gpu_memory_utilization": 0.85,
+    "temperature": 0.0,
+    "max_new_tokens": None,  # None = 使用下表；整数覆盖下表所有任务
+    "max_new_tokens_by_task": {
+        "FOMC": 8, "ScienceQA": 1024, "NumGLUE-cm": 32, "NumGLUE-ds": 32,
+        "C-STANCE": 8, "MeetingBank": 1024, "Py150": 256, "20Minuten": 512,
+    },
+    "dry_run": False,
+}
+launch("evaluate", CONFIG)
+PYCONFIG

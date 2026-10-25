@@ -1,0 +1,11 @@
+#!/bin/bash
+#PBS -N drsp_smoke
+#PBS -q regular-g
+#PBS -W group_list=gn77
+#PBS -l select=3:mpiprocs=1
+#PBS -l walltime=00:10:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?}"
+: "${DRSP_STUDY_ROOT:?separate frozen smoke directory required}"
+python3 "$DRSP_STUDY_ROOT/code_snapshot/scripts/drsp_study.py" --dispatch "$DRSP_STUDY_ROOT" --smoke-only

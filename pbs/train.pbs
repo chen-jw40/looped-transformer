@@ -1,0 +1,130 @@
+#!/bin/bash
+#PBS -N ouro_train
+#PBS -q regular-g
+#PBS -W group_list=gn77
+#PBS -l select=1
+#PBS -l walltime=12:00:00
+#PBS -j oe
+# 当前默认 Projected：旧实验实测 7–8.5h，预留全深度基与全阶段评估开销；其他方法另估时限。
+# 多 seed 顺序运行：qsub -l walltime=48:00:00 -v SEEDS=42:43:44:45:46,RUN_DIR=runs/new_projected_seeds pbs/train.pbs
+set -euo pipefail
+cd "${PBS_O_WORKDIR:-$PWD}"
+
+# 以下为 Python 配置；PBS_DRY_RUN=1 时仅打印解析结果，不申请/启动 GPU 进程。
+python3 - <<'PYCONFIG'
+import os
+from pathlib import Path
+from scripts.pbs_launch import launch
+from scripts.parameters import REPO_ROOT
+
+# qsub -v 可覆盖 METHOD、SEED、RUN_DIR；SEEDS=42:43:44:45:46 启用单卡顺序模式。
+# 多 seed 时 RUN_DIR 是根目录，实际输出到其 seedXX 子目录；SEEDS 优先于 SEED。
+METHOD = os.environ.get("METHOD", "projected")  # full / projected / osft / olora / ewc
+TASKS = ["FOMC", "ScienceQA", "NumGLUE-cm", "NumGLUE-ds",
+         "C-STANCE", "MeetingBank", "Py150", "20Minuten"]
+LEARNING_RATES = {"full": 1e-5, "projected": 1e-5, "osft": 1e-5, "olora": 1e-5, "ewc": 1e-5}
+CONFIG = {
+    # 模型、数据及训练序列；输出必须是新目录。
+    "method": METHOD,
+    "output_dir": os.environ.get("RUN_DIR", f"runs/new_{METHOD}"),
+    "model": "models/Ouro-1.4B",
+    "data_root": "data/TRACE/TRACE-Benchmark/LLM-CL-Benchmark_5000",
+    "tasks": TASKS,
+    "seed": int(os.environ.get("SEED", "42")),
+    "loops": 4,
+    "train_limit": 5000,
+    "epochs": None,  # TRACE per-task 3/5/7 epochs
+    "learning_rate": LEARNING_RATES[METHOD],
+    "weight_decay": 0.0,
+    "micro_batch_size": 8,
+    "gradient_accumulation": 16,
+    "max_length": 4096,
+    "truncate_long_prompts": True,
+
+    # 固定 epoch 训练；不运行 early stopping 或恢复中间最佳权重。
+    "early_stopping": False,
+    "early_stopping_steps": 150,
+    "early_stopping_max_evals": 6,
+    "early_stopping_samples": 128,
+    "early_stopping_seed": 42,
+    "early_stopping_patience": 2,
+    "early_stopping_min_delta": 0.001,
+
+    # 全参数 projected 的历史激活投影。
+    "projection_scope": "all-linear",  # 全参数 projected：all-linear / o-proj
+    "basis_depth_mode": "all",  # all: 分深度；last: 仅最后深度；task: 旧路由
+    "route_depths": None,  # 仅 task 模式使用，如 [0, 0, 1, 1, 2, 2, 3, 3]
+    "stat_samples": 64,
+    "stat_vectors_per_call": 4,
+    "stat_vectors_per_layer": 256,  # 每个物理线性模块、每个深度的采样向量上限
+    "basis_max_rank": 128,  # 每组累计上限；last 单组 128，all 每深度 128，合并可达 512
+    "basis_residual_tolerance": 0.05,
+    # OSFT：保护比例为 (stage-1)/任务数，与循环深度无关；前后投影均启用。
+    "osft_tolerance": 1e-4,
+
+    # O-LoRA：原作者发布代码版本，仅 q/v，所有循环共享 adapter。
+    "olora_rank": 8,
+    "olora_alpha": 32.0,
+    "olora_dropout": 0.1,
+    "olora_orthogonality_weight": 0.5,
+    "olora_norm_weight": 0.0,
+
+    # 多任务对角 EWC；仅用任务结束后的训练样本估计 Fisher。
+    "ewc_lambda": float(os.environ.get("EWC_LAMBDA", "400")),
+    "ewc_fisher_samples": int(os.environ.get("EWC_FISHER_SAMPLES", "64")),
+
+    # 训练后评测：train_only=True 可跳过；None 表示不限制 eval 样本数。
+    "train_only": False,
+    "eval_tasks": TASKS,
+    "eval_split": "test",
+    "eval_limit": None,
+    "eval_loops": 4,
+    "checkpoint_scope": "all" if METHOD in {"projected", "osft", "olora", "ewc"} else "final",  # final / all
+    "batch_size": 64,
+    "gpu_memory_utilization": 0.85,
+    "temperature": 0.0,
+    "max_new_tokens": None,  # 设为整数时覆盖下方所有任务的生成上限
+    "max_new_tokens_by_task": {
+        "FOMC": 8, "ScienceQA": 1024, "NumGLUE-cm": 32, "NumGLUE-ds": 32,
+        "C-STANCE": 8, "MeetingBank": 1024, "Py150": 256, "20Minuten": 512,
+    },
+
+    # 日志；None 表示不指定可选参数。
+    "env_file": ".env",
+    "wandb_project": "ouro-continual-learning",
+    "wandb_entity": None,
+    "wandb_run_name": None,
+    "wandb_mode": "disabled",  # online / offline / disabled
+    "dry_run": False,
+}
+if "SEEDS" in os.environ:
+    seeds = [int(value) for value in os.environ["SEEDS"].split(":")]
+    if any(seed < 0 for seed in seeds) or len(set(seeds)) != len(seeds):
+        raise ValueError("SEEDS must contain distinct nonnegative integers separated by ':'")
+    root = Path(os.environ.get("RUN_DIR", f"runs/new_{METHOD}_seeds"))
+    configs = [{**CONFIG, "seed": seed, "output_dir": str(root / f"seed{seed}")}
+               for seed in seeds]
+else:
+    configs = [CONFIG]
+
+# 先检查全部目录，避免跑完前几个 seed 才发现后续输出目录已存在。
+preview = os.environ.get("PBS_DRY_RUN") == "1" or CONFIG["dry_run"]
+for config in configs:
+    output = (REPO_ROOT / config["output_dir"]).resolve()
+    if output.is_relative_to((REPO_ROOT / "result").resolve()):
+        raise ValueError("New training experiments must write to runs/, not result/")
+    if not preview and output.exists():
+        raise FileExistsError(output)
+for config in configs:
+    # launch 等待训练子进程和全部评估结束，再启动下一个 seed；失败时退出。
+    launch("train", config)
+# 多 seed study 的最后一个完成作业自动汇总；普通独立运行不设置此变量。
+if os.environ.get("EWC_STUDY_ROOT"):
+    launch("summarize-study", {"output_root": os.environ["EWC_STUDY_ROOT"],
+                              "methods": ["ewc"], "if_ready": True})
+elif os.environ.get("OLORA_STUDY_ROOT"):
+    launch("summarize-study", {"output_root": os.environ["OLORA_STUDY_ROOT"],
+                              "methods": ["full", "olora"], "if_ready": True})
+elif os.environ.get("OSFT_STUDY_ROOT"):
+    launch("summarize-study", {"output_root": os.environ["OSFT_STUDY_ROOT"], "if_ready": True})
+PYCONFIG
